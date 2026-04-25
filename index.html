@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SVG MVP – Vorschau & Freigabe</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="panel controls">
+        <h1>SVG-Erstellung (MVP)</h1>
+        <p class="subtitle">
+          Passe die Parameter an, prüfe die Vorschau und gib erst dann das SVG
+          für den nächsten Prozessschritt frei.
+        </p>
+
+        <form id="parameter-form" class="form-grid" autocomplete="off">
+          <label>
+            Breite
+            <input type="number" name="width" min="100" max="2000" value="720" />
+          </label>
+          <label>
+            Höhe
+            <input type="number" name="height" min="100" max="2000" value="420" />
+          </label>
+          <label>
+            Eckenradius
+            <input type="number" name="radius" min="0" max="200" value="24" />
+          </label>
+          <label>
+            Randstärke
+            <input type="number" name="strokeWidth" min="0" max="40" value="6" />
+          </label>
+          <label>
+            Hintergrundfarbe
+            <input type="color" name="background" value="#f7f8fb" />
+          </label>
+          <label>
+            Akzentfarbe
+            <input type="color" name="accent" value="#0f62fe" />
+          </label>
+          <label>
+            Text
+            <input type="text" name="label" value="SVG MVP Vorschau" maxlength="60" />
+          </label>
+          <label>
+            Textgröße
+            <input type="number" name="fontSize" min="8" max="120" value="34" />
+          </label>
+        </form>
+
+        <div class="actions">
+          <button id="export-btn" type="button">SVG exportieren</button>
+          <button id="approve-btn" type="button" class="primary">
+            SVG freigeben &amp; weiter
+          </button>
+        </div>
+
+        <p id="status" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="panel preview">
+        <h2>Live-Vorschau</h2>
+        <div id="preview" class="preview-box" aria-label="SVG Vorschau"></div>
+        <details>
+          <summary>Rohdaten (SVG-Markup)</summary>
+          <pre id="svg-code"></pre>
+        </details>
+      </section>
+    </main>
+
+    <script type="module" src="src/app.js"></script>
+  </body>
+</html>
