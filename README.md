@@ -27,6 +27,16 @@ Dann öffnen: <http://localhost:8080>
 4. **SVG exportieren** lädt die erzeugte Datei `schwarze-form.svg` herunter.
 5. **SVG freigeben & weiter** löst weiterhin das Integrations-Event aus.
 
+## Code prüfen
+
+Vor Änderungen oder vor dem Weitergeben kannst du Syntax und Vektorisierungs-Tests ausführen:
+
+```bash
+npm run check
+```
+
+Der Check prüft `src/app.js` und `src/vectorize.js` syntaktisch und testet die SVG-Vektorisierung mit Node.js.
+
 ## Integrationspunkt für das Gesamtsystem
 
 Bei Freigabe wird im Frontend ein Event ausgelöst:
