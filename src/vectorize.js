@@ -4,9 +4,7 @@ const KEY_PRECISION = 6;
 const NUMBER_PRECISION = 3;
 const HISTOGRAM_SIZE = 256;
 const MIN_CONTRAST = 12;
-const DEFAULT_CURVE_TENSION = 0.9;
-const EXACT_CURVE_TENSION = 0;
-const MAX_FIT_SAMPLE_PIXELS = 12000;
+const DEFAULT_CURVE_TENSION = 0.75;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -17,7 +15,7 @@ const formatNumber = (value) => {
 
 const getPointKey = (x, y) => `${x.toFixed(KEY_PRECISION)}${POINT_KEY_SEPARATOR}${y.toFixed(KEY_PRECISION)}`;
 
-const getPixelIndex = (x, y, width) => y * width + x;
+const getMaskIndex = (x, y, width) => y * width + x;
 
 const getPixelLuminance = (data, pixelIndex) => {
   const dataIndex = pixelIndex * 4;
@@ -93,44 +91,206 @@ const createLuminanceHistogram = (imageData) => {
   return { histogram, total };
 };
 
-const estimateAutoParameters = (imageData) => {
-  const { width, height } = imageData;
+const estimateThreshold = (imageData) => {
   const { histogram, total } = createLuminanceHistogram(imageData);
-
   const low = getPercentileFromHistogram(histogram, total, 0.05);
   const high = getPercentileFromHistogram(histogram, total, 0.95);
-  const contrast = high - low;
-  const threshold = contrast >= MIN_CONTRAST ? (low + high) / 2 : getOtsuThreshold(histogram, total);
-  const longestSide = Math.max(width, height);
-  const tolerance = clamp(longestSide * 0.0025, 0.35, 2.2);
-  const smoothingPasses = longestSide >= 300 ? 2 : 1;
+
+  return high - low >= MIN_CONTRAST ? (low + high) / 2 : getOtsuThreshold(histogram, total);
+};
+
+const resolveParameters = (imageData, options = {}) => {
+  const autoOptimize = Boolean(options.autoOptimize);
+  const threshold = autoOptimize || options.threshold === undefined
+    ? estimateThreshold(imageData)
+    : clamp(Number(options.threshold), 0, 255);
+  const longestSide = Math.max(imageData.width, imageData.height);
+  const tolerance = options.tolerance === undefined
+    ? clamp(longestSide * 0.0015, 0, 1.5)
+    : Math.max(0, Number(options.tolerance) || 0);
+  const smoothingPasses = options.smoothingPasses === undefined
+    ? (autoOptimize && longestSide >= 220 ? 1 : 0)
+    : Math.max(0, Math.floor(Number(options.smoothingPasses) || 0));
+  const curveTension = options.curveTension === undefined
+    ? (smoothingPasses > 0 ? DEFAULT_CURVE_TENSION : 0)
+    : clamp(Number(options.curveTension), 0, 1.5);
+  const speckleThreshold = Math.max(0, Math.floor(Number(options.speckleThreshold) || 0));
 
   return {
+    autoOptimize,
     threshold: clamp(threshold, 0, 255),
     tolerance,
     smoothingPasses,
-    curveTension: DEFAULT_CURVE_TENSION,
+    curveTension,
+    speckleThreshold,
   };
 };
 
-const createThresholdCandidates = (imageData, preferredThreshold) => {
-  const { histogram, total } = createLuminanceHistogram(imageData);
-  const otsu = getOtsuThreshold(histogram, total);
-  const low = getPercentileFromHistogram(histogram, total, 0.02);
-  const high = getPercentileFromHistogram(histogram, total, 0.98);
-  const midpoint = (low + high) / 2;
-  const seeds = [preferredThreshold, otsu, midpoint, 32, 64, 96, 128, 160, 192, 224]
-    .filter((value) => Number.isFinite(Number(value)))
-    .map((value) => Math.round(clamp(Number(value), 0, 255)));
-  const candidates = new Set();
+const createBinaryMask = (imageData, threshold) => {
+  const { data, width, height } = imageData;
+  const mask = new Uint8Array(width * height);
+  let darkCount = 0;
 
-  for (const seed of seeds) {
-    for (const delta of [-24, -12, -6, 0, 6, 12, 24]) {
-      candidates.add(Math.round(clamp(seed + delta, 0, 255)));
+  for (let index = 0; index < mask.length; index += 1) {
+    const isDark = getPixelLuminance(data, index) <= threshold;
+    mask[index] = isDark ? 1 : 0;
+    darkCount += isDark ? 1 : 0;
+  }
+
+  return { mask, width, height, darkCount };
+};
+
+const isDarkAt = ({ mask, width, height }, x, y) =>
+  x >= 0 && y >= 0 && x < width && y < height && mask[getMaskIndex(x, y, width)] === 1;
+
+const removeSpeckles = (binary, speckleThreshold) => {
+  if (speckleThreshold <= 1 || binary.darkCount === 0) {
+    return binary;
+  }
+
+  const { mask, width, height } = binary;
+  const visited = new Uint8Array(mask.length);
+  let darkCount = binary.darkCount;
+
+  for (let startIndex = 0; startIndex < mask.length; startIndex += 1) {
+    if (mask[startIndex] === 0 || visited[startIndex]) {
+      continue;
+    }
+
+    const stack = [startIndex];
+    const component = [];
+    visited[startIndex] = 1;
+
+    while (stack.length) {
+      const index = stack.pop();
+      component.push(index);
+      const x = index % width;
+      const y = Math.floor(index / width);
+      const neighbors = [
+        x > 0 ? index - 1 : -1,
+        x < width - 1 ? index + 1 : -1,
+        y > 0 ? index - width : -1,
+        y < height - 1 ? index + width : -1,
+      ];
+
+      for (const nextIndex of neighbors) {
+        if (nextIndex >= 0 && mask[nextIndex] === 1 && !visited[nextIndex]) {
+          visited[nextIndex] = 1;
+          stack.push(nextIndex);
+        }
+      }
+    }
+
+    if (component.length < speckleThreshold) {
+      for (const index of component) {
+        mask[index] = 0;
+      }
+
+      darkCount -= component.length;
     }
   }
 
-  return [...candidates].sort((a, b) => a - b);
+  return { ...binary, darkCount };
+};
+
+const addEdge = (edgesByStart, start, end) => {
+  const edge = { start, end };
+  const key = getPointKey(start[0], start[1]);
+
+  if (!edgesByStart.has(key)) {
+    edgesByStart.set(key, []);
+  }
+
+  edgesByStart.get(key).push(edge);
+};
+
+const buildBoundaryEdges = (binary) => {
+  const edgesByStart = new Map();
+  const { width, height } = binary;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!isDarkAt(binary, x, y)) {
+        continue;
+      }
+
+      if (!isDarkAt(binary, x, y - 1)) {
+        addEdge(edgesByStart, [x, y], [x + 1, y]);
+      }
+
+      if (!isDarkAt(binary, x + 1, y)) {
+        addEdge(edgesByStart, [x + 1, y], [x + 1, y + 1]);
+      }
+
+      if (!isDarkAt(binary, x, y + 1)) {
+        addEdge(edgesByStart, [x + 1, y + 1], [x, y + 1]);
+      }
+
+      if (!isDarkAt(binary, x - 1, y)) {
+        addEdge(edgesByStart, [x, y + 1], [x, y]);
+      }
+    }
+  }
+
+  return edgesByStart;
+};
+
+const popNextEdge = (edgesByStart, point) => {
+  const key = getPointKey(point[0], point[1]);
+  const edges = edgesByStart.get(key);
+
+  if (!edges?.length) {
+    return null;
+  }
+
+  const edge = edges.pop();
+
+  if (edges.length === 0) {
+    edgesByStart.delete(key);
+  }
+
+  return edge;
+};
+
+const traceBoundaryLoops = (edgesByStart) => {
+  const loops = [];
+
+  while (edgesByStart.size > 0) {
+    const firstEdges = edgesByStart.values().next().value;
+    const firstEdge = firstEdges.pop();
+
+    if (firstEdges.length === 0) {
+      edgesByStart.delete(getPointKey(firstEdge.start[0], firstEdge.start[1]));
+    }
+
+    const loop = [firstEdge.start, firstEdge.end];
+    const startKey = getPointKey(firstEdge.start[0], firstEdge.start[1]);
+    let current = firstEdge.end;
+
+    while (getPointKey(current[0], current[1]) !== startKey) {
+      const nextEdge = popNextEdge(edgesByStart, current);
+
+      if (!nextEdge) {
+        break;
+      }
+
+      current = nextEdge.end;
+      loop.push(current);
+    }
+
+    if (loop.length > 3 && getPointKey(current[0], current[1]) === startKey) {
+      loops.push(loop);
+    }
+  }
+
+  return loops;
+};
+
+const stripClosingPoint = (loop) => {
+  const first = loop[0];
+  const last = loop.at(-1);
+
+  return first && last && first[0] === last[0] && first[1] === last[1] ? loop.slice(0, -1) : loop.slice();
 };
 
 const signedArea = (loop) => {
@@ -144,150 +304,6 @@ const signedArea = (loop) => {
   }
 
   return area / 2;
-};
-
-const pointInLoop = (pointX, pointY, loop) => {
-  const points = stripClosingPoint(loop);
-  let inside = false;
-
-  for (
-    let currentIndex = 0, previousIndex = points.length - 1;
-    currentIndex < points.length;
-    previousIndex = currentIndex, currentIndex += 1
-  ) {
-    const [currentX, currentY] = points[currentIndex];
-    const [previousX, previousY] = points[previousIndex];
-    const crosses = currentY > pointY !== previousY > pointY;
-
-    if (crosses) {
-      const intersectionX = ((previousX - currentX) * (pointY - currentY)) / (previousY - currentY) + currentX;
-
-      if (pointX < intersectionX) {
-        inside = !inside;
-      }
-    }
-  }
-
-  return inside;
-};
-
-const pointInEvenOddLoops = (pointX, pointY, loops) => loops.reduce(
-  (inside, loop) => (pointInLoop(pointX, pointY, loop) ? !inside : inside),
-  false,
-);
-
-const createFitSamples = (imageData, targetThreshold) => {
-  const { width, height, data } = imageData;
-  const step = Math.max(1, Math.ceil(Math.sqrt((width * height) / MAX_FIT_SAMPLE_PIXELS)));
-  const samples = [];
-  let darkCount = 0;
-
-  for (let y = Math.floor(step / 2); y < height; y += step) {
-    for (let x = Math.floor(step / 2); x < width; x += step) {
-      const isDark = getPixelLuminance(data, getPixelIndex(x, y, width)) <= targetThreshold;
-      samples.push({ x: x + 0.5, y: y + 0.5, isDark });
-      darkCount += isDark ? 1 : 0;
-    }
-  }
-
-  return { samples, darkCount, lightCount: samples.length - darkCount };
-};
-
-const scoreLoopsAgainstImage = (loops, fitSamples) => {
-  if (!loops.length || !fitSamples.samples.length) {
-    return {
-      errorRate: 1,
-      falsePositiveRate: 1,
-      falseNegativeRate: 1,
-      matched: 0,
-      total: fitSamples.samples.length,
-    };
-  }
-
-  let falsePositive = 0;
-  let falseNegative = 0;
-  let matched = 0;
-
-  for (const sample of fitSamples.samples) {
-    const inSvg = pointInEvenOddLoops(sample.x, sample.y, loops);
-
-    if (inSvg === sample.isDark) {
-      matched += 1;
-    } else if (inSvg) {
-      falsePositive += 1;
-    } else {
-      falseNegative += 1;
-    }
-  }
-
-  return {
-    errorRate: (falsePositive + falseNegative) / fitSamples.samples.length,
-    falsePositiveRate: falsePositive / Math.max(1, fitSamples.lightCount),
-    falseNegativeRate: falseNegative / Math.max(1, fitSamples.darkCount),
-    matched,
-    total: fitSamples.samples.length,
-  };
-};
-
-const createFitCandidateOptions = (imageData, options = {}) => {
-  const estimated = estimateAutoParameters(imageData);
-  const thresholds = createThresholdCandidates(imageData, options.threshold ?? estimated.threshold);
-  const toleranceValues = [0, 0.05, 0.1, 0.2, estimated.tolerance]
-    .map((value) => Number(value.toFixed(3)))
-    .filter((value, index, values) => values.indexOf(value) === index);
-  const candidates = [];
-
-  for (const threshold of thresholds) {
-    for (const tolerance of toleranceValues) {
-      candidates.push({
-        threshold,
-        tolerance,
-        smoothingPasses: 0,
-        curveTension: EXACT_CURVE_TENSION,
-      });
-    }
-  }
-
-  candidates.push({ ...estimated, smoothingPasses: 1, curveTension: DEFAULT_CURVE_TENSION });
-  return candidates;
-};
-
-const prepareLoops = (loops, { tolerance = 0, smoothingPasses = 0 } = {}) =>
-  loops
-    .map((loop) => simplifyClosedLoop(loop, Math.max(0, Number(tolerance) || 0)))
-    .map((loop) => chaikinSmoothClosedLoop(loop, Math.max(0, Number(smoothingPasses) || 0)))
-    .filter((loop) => stripClosingPoint(loop).length >= 3)
-    .sort((a, b) => Math.abs(signedArea(b)) - Math.abs(signedArea(a)));
-
-const fitParametersToImage = (imageData, options = {}) => {
-  const targetParameters = estimateAutoParameters(imageData);
-  const targetThreshold = targetParameters.threshold;
-  const fitSamples = createFitSamples(imageData, targetThreshold);
-  let best = null;
-
-  for (const candidate of createFitCandidateOptions(imageData, options)) {
-    const segments = buildContourSegments(imageData, candidate);
-    const rawLoops = traceLoops(segments);
-    const loops = prepareLoops(rawLoops, candidate);
-    const score = scoreLoopsAgainstImage(loops, fitSamples);
-
-    if (
-      !best ||
-      score.errorRate < best.score.errorRate ||
-      (score.errorRate === best.score.errorRate && candidate.tolerance < best.parameters.tolerance)
-    ) {
-      best = { parameters: candidate, rawLoops, loops, score };
-    }
-  }
-
-  return {
-    ...best,
-    parameters: {
-      ...best.parameters,
-      autoOptimize: true,
-      targetThreshold,
-    },
-  };
 };
 
 const getBounds = (loops) => {
@@ -310,178 +326,6 @@ const getBounds = (loops) => {
   }
 
   return { minX, minY, maxX, maxY };
-};
-
-const getSampleIndex = (x, y, sampleWidth) => y * sampleWidth + x;
-
-const createLuminanceSamples = (imageData, threshold) => {
-  const { data, width, height } = imageData;
-  const sampleWidth = width + 2;
-  const sampleHeight = height + 2;
-  const samples = new Float32Array(sampleWidth * sampleHeight);
-  samples.fill(WHITE_LUMINANCE);
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      samples[getSampleIndex(x + 1, y + 1, sampleWidth)] = getPixelLuminance(
-        data,
-        getPixelIndex(x, y, width),
-      );
-    }
-  }
-
-  return {
-    samples,
-    sampleWidth,
-    threshold: clamp(Number(threshold ?? 128), 0, 255),
-  };
-};
-
-const interpolate = (from, to, threshold) => {
-  const delta = to.value - from.value;
-  const ratio = delta === 0 ? 0.5 : clamp((threshold - from.value) / delta, 0, 1);
-
-  return [from.x + (to.x - from.x) * ratio, from.y + (to.y - from.y) * ratio];
-};
-
-const createSamplePoint = (samples, sampleWidth, x, y) => ({
-  x: x - 0.5,
-  y: y - 0.5,
-  value: samples[getSampleIndex(x, y, sampleWidth)],
-});
-
-const addSegment = (segments, first, second) => {
-  if (first[0] === second[0] && first[1] === second[1]) {
-    return;
-  }
-
-  segments.push({
-    a: first,
-    b: second,
-    aKey: getPointKey(first[0], first[1]),
-    bKey: getPointKey(second[0], second[1]),
-    used: false,
-  });
-};
-
-const buildContourSegments = (imageData, options = {}) => {
-  const { width, height } = imageData;
-  const { samples, sampleWidth, threshold } = createLuminanceSamples(imageData, options.threshold);
-  const segments = [];
-
-  for (let y = 0; y < height + 1; y += 1) {
-    for (let x = 0; x < width + 1; x += 1) {
-      const topLeft = createSamplePoint(samples, sampleWidth, x, y);
-      const topRight = createSamplePoint(samples, sampleWidth, x + 1, y);
-      const bottomRight = createSamplePoint(samples, sampleWidth, x + 1, y + 1);
-      const bottomLeft = createSamplePoint(samples, sampleWidth, x, y + 1);
-      const insideTopLeft = topLeft.value <= threshold;
-      const insideTopRight = topRight.value <= threshold;
-      const insideBottomRight = bottomRight.value <= threshold;
-      const insideBottomLeft = bottomLeft.value <= threshold;
-      const caseIndex =
-        (insideTopLeft ? 1 : 0) |
-        (insideTopRight ? 2 : 0) |
-        (insideBottomRight ? 4 : 0) |
-        (insideBottomLeft ? 8 : 0);
-
-      if (caseIndex === 0 || caseIndex === 15) {
-        continue;
-      }
-
-      const edgePoints = {
-        top: interpolate(topLeft, topRight, threshold),
-        right: interpolate(topRight, bottomRight, threshold),
-        bottom: interpolate(bottomLeft, bottomRight, threshold),
-        left: interpolate(topLeft, bottomLeft, threshold),
-      };
-
-      const segmentSpecs = {
-        1: [['left', 'top']],
-        2: [['top', 'right']],
-        3: [['left', 'right']],
-        4: [['right', 'bottom']],
-        5: [['left', 'top'], ['right', 'bottom']],
-        6: [['top', 'bottom']],
-        7: [['left', 'bottom']],
-        8: [['bottom', 'left']],
-        9: [['top', 'bottom']],
-        10: [['top', 'right'], ['bottom', 'left']],
-        11: [['right', 'bottom']],
-        12: [['left', 'right']],
-        13: [['top', 'right']],
-        14: [['left', 'top']],
-      };
-
-      for (const [firstEdge, secondEdge] of segmentSpecs[caseIndex]) {
-        addSegment(segments, edgePoints[firstEdge], edgePoints[secondEdge]);
-      }
-    }
-  }
-
-  return segments;
-};
-
-const buildSegmentIndex = (segments) => {
-  const segmentsByPoint = new Map();
-
-  const addToIndex = (pointKey, segment) => {
-    if (!segmentsByPoint.has(pointKey)) {
-      segmentsByPoint.set(pointKey, []);
-    }
-
-    segmentsByPoint.get(pointKey).push(segment);
-  };
-
-  for (const segment of segments) {
-    addToIndex(segment.aKey, segment);
-    addToIndex(segment.bKey, segment);
-  }
-
-  return segmentsByPoint;
-};
-
-const getNextSegment = (segmentsByPoint, currentKey) => {
-  const candidates = segmentsByPoint.get(currentKey) || [];
-  return candidates.find((segment) => !segment.used) || null;
-};
-
-const getOtherEndpoint = (segment, pointKey) =>
-  segment.aKey === pointKey ? { point: segment.b, key: segment.bKey } : { point: segment.a, key: segment.aKey };
-
-const traceLoops = (segments) => {
-  const loops = [];
-  const segmentsByPoint = buildSegmentIndex(segments);
-
-  for (const segment of segments) {
-    if (segment.used) {
-      continue;
-    }
-
-    const points = [segment.a];
-    const startKey = segment.aKey;
-    let currentSegment = segment;
-    let currentKey = segment.aKey;
-
-    while (currentSegment && !currentSegment.used) {
-      currentSegment.used = true;
-      const next = getOtherEndpoint(currentSegment, currentKey);
-      points.push(next.point);
-      currentKey = next.key;
-
-      if (currentKey === startKey) {
-        break;
-      }
-
-      currentSegment = getNextSegment(segmentsByPoint, currentKey);
-    }
-
-    if (points.length > 3 && currentKey === startKey) {
-      loops.push(points);
-    }
-  }
-
-  return loops;
 };
 
 const perpendicularDistance = (point, lineStart, lineEnd) => {
@@ -525,12 +369,37 @@ const simplifyOpenPoints = (points, tolerance) => {
   return left.slice(0, -1).concat(right);
 };
 
+
+const removeCollinearPoints = (loop) => {
+  const points = stripClosingPoint(loop);
+
+  if (points.length <= 3) {
+    return loop;
+  }
+
+  const compacted = [];
+
+  for (let index = 0; index < points.length; index += 1) {
+    const previous = points[(index - 1 + points.length) % points.length];
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    const crossProduct = (current[0] - previous[0]) * (next[1] - current[1])
+      - (current[1] - previous[1]) * (next[0] - current[0]);
+
+    if (crossProduct !== 0) {
+      compacted.push(current);
+    }
+  }
+
+  return compacted.concat([compacted[0]]);
+};
+
 const simplifyClosedLoop = (loop, tolerance) => {
   if (loop.length <= 4 || tolerance <= 0) {
     return loop;
   }
 
-  const openLoop = loop.slice(0, -1);
+  const openLoop = stripClosingPoint(loop);
   const anchorIndex = openLoop.reduce((bestIndex, point, index) => {
     const best = openLoop[bestIndex];
     return point[0] < best[0] || (point[0] === best[0] && point[1] < best[1]) ? index : bestIndex;
@@ -546,13 +415,6 @@ const simplifyClosedLoop = (loop, tolerance) => {
   return simplified.at(-1)[0] === first[0] && simplified.at(-1)[1] === first[1]
     ? simplified
     : simplified.concat([first]);
-};
-
-const stripClosingPoint = (loop) => {
-  const first = loop[0];
-  const last = loop.at(-1);
-
-  return first && last && first[0] === last[0] && first[1] === last[1] ? loop.slice(0, -1) : loop.slice();
 };
 
 const chaikinSmoothClosedLoop = (loop, passes) => {
@@ -580,7 +442,14 @@ const chaikinSmoothClosedLoop = (loop, passes) => {
   return points;
 };
 
-const loopToCubicPathData = (loop, { offsetX, offsetY, curveTension }) => {
+const prepareLoops = (loops, parameters) => loops
+  .map(removeCollinearPoints)
+  .map((loop) => simplifyClosedLoop(loop, parameters.tolerance))
+  .map((loop) => chaikinSmoothClosedLoop(loop, parameters.smoothingPasses))
+  .filter((loop) => stripClosingPoint(loop).length >= 3)
+  .sort((a, b) => Math.abs(signedArea(b)) - Math.abs(signedArea(a)));
+
+const loopToPathData = (loop, { offsetX, offsetY, curveTension }) => {
   const points = stripClosingPoint(loop);
 
   if (points.length < 3) {
@@ -588,52 +457,115 @@ const loopToCubicPathData = (loop, { offsetX, offsetY, curveTension }) => {
   }
 
   const commands = [`M ${formatNumber(points[0][0] - offsetX)} ${formatNumber(points[0][1] - offsetY)}`];
-  const tension = clamp(Number(curveTension) || DEFAULT_CURVE_TENSION, 0, 1.5);
+  const tension = clamp(Number(curveTension) || 0, 0, 1.5);
 
-  for (let index = 0; index < points.length; index += 1) {
-    const previous = points[(index - 1 + points.length) % points.length];
-    const current = points[index];
-    const next = points[(index + 1) % points.length];
-    const afterNext = points[(index + 2) % points.length];
-    const control1 = [
-      current[0] + ((next[0] - previous[0]) * tension) / 6,
-      current[1] + ((next[1] - previous[1]) * tension) / 6,
-    ];
-    const control2 = [
-      next[0] - ((afterNext[0] - current[0]) * tension) / 6,
-      next[1] - ((afterNext[1] - current[1]) * tension) / 6,
-    ];
+  if (tension === 0) {
+    for (let index = 1; index < points.length; index += 1) {
+      commands.push(`L ${formatNumber(points[index][0] - offsetX)} ${formatNumber(points[index][1] - offsetY)}`);
+    }
+  } else {
+    for (let index = 0; index < points.length; index += 1) {
+      const previous = points[(index - 1 + points.length) % points.length];
+      const current = points[index];
+      const next = points[(index + 1) % points.length];
+      const afterNext = points[(index + 2) % points.length];
+      const control1 = [
+        current[0] + ((next[0] - previous[0]) * tension) / 6,
+        current[1] + ((next[1] - previous[1]) * tension) / 6,
+      ];
+      const control2 = [
+        next[0] - ((afterNext[0] - current[0]) * tension) / 6,
+        next[1] - ((afterNext[1] - current[1]) * tension) / 6,
+      ];
 
-    commands.push(
-      `C ${formatNumber(control1[0] - offsetX)} ${formatNumber(control1[1] - offsetY)} ${formatNumber(
-        control2[0] - offsetX,
-      )} ${formatNumber(control2[1] - offsetY)} ${formatNumber(next[0] - offsetX)} ${formatNumber(
-        next[1] - offsetY,
-      )}`,
-    );
+      commands.push(
+        `C ${formatNumber(control1[0] - offsetX)} ${formatNumber(control1[1] - offsetY)} ${formatNumber(
+          control2[0] - offsetX,
+        )} ${formatNumber(control2[1] - offsetY)} ${formatNumber(next[0] - offsetX)} ${formatNumber(
+          next[1] - offsetY,
+        )}`,
+      );
+    }
   }
 
   commands.push('Z');
   return commands.join(' ');
 };
 
-const loopsToPathData = (
-  loops,
-  { offsetX = 0, offsetY = 0, tolerance = 1, smoothingPasses = 0, curveTension = DEFAULT_CURVE_TENSION } = {},
-) =>
-  loops
-    .map((loop) => simplifyClosedLoop(loop, tolerance))
-    .map((loop) => chaikinSmoothClosedLoop(loop, Math.max(0, Number(smoothingPasses) || 0)))
-    .map((loop) => loopToCubicPathData(loop, { offsetX, offsetY, curveTension }))
-    .filter(Boolean)
-    .join(' ');
+const loopsToPathData = (loops, pathOptions) => loops
+  .map((loop) => loopToPathData(loop, pathOptions))
+  .filter(Boolean)
+  .join(' ');
+
+const countMatchedPixels = (binary, loops) => {
+  const total = binary.width * binary.height;
+  let matched = 0;
+
+  for (let y = 0; y < binary.height; y += 1) {
+    for (let x = 0; x < binary.width; x += 1) {
+      const isDark = isDarkAt(binary, x, y);
+      const inSvg = pointInEvenOddLoops(x + 0.5, y + 0.5, loops);
+      matched += isDark === inSvg ? 1 : 0;
+    }
+  }
+
+  return {
+    errorRate: total === 0 ? 0 : (total - matched) / total,
+    matched,
+    total,
+  };
+};
+
+const pointInLoop = (pointX, pointY, loop) => {
+  const points = stripClosingPoint(loop);
+  let inside = false;
+
+  for (
+    let currentIndex = 0, previousIndex = points.length - 1;
+    currentIndex < points.length;
+    previousIndex = currentIndex, currentIndex += 1
+  ) {
+    const [currentX, currentY] = points[currentIndex];
+    const [previousX, previousY] = points[previousIndex];
+    const crosses = currentY > pointY !== previousY > pointY;
+
+    if (crosses) {
+      const intersectionX = ((previousX - currentX) * (pointY - currentY)) / (previousY - currentY) + currentX;
+
+      if (pointX < intersectionX) {
+        inside = !inside;
+      }
+    }
+  }
+
+  return inside;
+};
+
+const pointInEvenOddLoops = (pointX, pointY, loops) => loops.reduce(
+  (inside, loop) => (pointInLoop(pointX, pointY, loop) ? !inside : inside),
+  false,
+);
 
 export const vectorizeBlackShape = (imageData, options = {}) => {
   const { width, height } = imageData;
-  const fit = options.autoOptimize ? fitParametersToImage(imageData, options) : null;
-  const autoParameters = fit?.parameters || {};
-  const resolvedOptions = { ...options, ...autoParameters };
-  const loops = fit?.rawLoops || traceLoops(buildContourSegments(imageData, resolvedOptions));
+  const parameters = resolveParameters(imageData, options);
+  const binary = removeSpeckles(createBinaryMask(imageData, parameters.threshold), parameters.speckleThreshold);
+
+  if (binary.darkCount === 0) {
+    return {
+      svg: '',
+      pathData: '',
+      width: 0,
+      height: 0,
+      viewBox: '0 0 0 0',
+      shapeCount: 0,
+      parameters,
+      comparison: null,
+    };
+  }
+
+  const rawLoops = traceBoundaryLoops(buildBoundaryEdges(binary));
+  const loops = prepareLoops(rawLoops, parameters);
   const bounds = getBounds(loops);
 
   if (!bounds) {
@@ -644,8 +576,8 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
       height: 0,
       viewBox: '0 0 0 0',
       shapeCount: 0,
-      parameters: { ...autoParameters },
-      comparison: fit?.score || null,
+      parameters,
+      comparison: null,
     };
   }
 
@@ -657,9 +589,7 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
   const pathData = loopsToPathData(loops, {
     offsetX,
     offsetY,
-    tolerance: Math.max(0, Number(resolvedOptions.tolerance) || 0),
-    smoothingPasses: Math.max(0, Number(resolvedOptions.smoothingPasses) || 0),
-    curveTension: resolvedOptions.curveTension,
+    curveTension: parameters.curveTension,
   });
   const viewBox = `0 0 ${formatNumber(svgWidth)} ${formatNumber(svgHeight)}`;
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
@@ -676,14 +606,7 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
     height: svgHeight,
     viewBox,
     shapeCount: loops.length,
-    parameters: {
-      threshold: resolvedOptions.threshold,
-      tolerance: Math.max(0, Number(resolvedOptions.tolerance) || 0),
-      smoothingPasses: Math.max(0, Number(resolvedOptions.smoothingPasses) || 0),
-      curveTension: resolvedOptions.curveTension ?? DEFAULT_CURVE_TENSION,
-      autoOptimize: Boolean(options.autoOptimize),
-      targetThreshold: resolvedOptions.targetThreshold,
-    },
-    comparison: fit?.score || null,
+    parameters,
+    comparison: countMatchedPixels(binary, loops),
   };
 };

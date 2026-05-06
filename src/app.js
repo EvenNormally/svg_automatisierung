@@ -30,7 +30,7 @@ const syncParameterControlState = () => {
   const formData = new FormData(form);
   const autoOptimize = formData.has('autoOptimize');
 
-  for (const field of form.querySelectorAll('[name="threshold"], [name="tolerance"]')) {
+  for (const field of form.querySelectorAll('[name="threshold"]')) {
     field.disabled = autoOptimize;
   }
 };
@@ -42,14 +42,8 @@ const setActionState = (enabled) => {
 
 const writeOptimizedParametersToForm = (parameters = {}) => {
   const thresholdInput = form.elements.threshold;
-  const toleranceInput = form.elements.tolerance;
-
   if (thresholdInput && Number.isFinite(Number(parameters.threshold))) {
     thresholdInput.value = Math.round(parameters.threshold);
-  }
-
-  if (toleranceInput && Number.isFinite(Number(parameters.tolerance))) {
-    toleranceInput.value = Number(parameters.tolerance).toFixed(2);
   }
 };
 
@@ -95,15 +89,14 @@ const render = () => {
   const comparisonInfo = result.comparison
     ? ` Abgleich: ${((1 - result.comparison.errorRate) * 100).toFixed(1)}% Pixel-Übereinstimmung (${result.comparison.matched}/${result.comparison.total} Stichproben).`
     : '';
-  const parameterInfo = result.parameters?.autoOptimize
-    ? [
-        ` Automatisch abgeglichen: Schwellenwert ${Math.round(result.parameters.threshold)}`,
-        `Ziel-Schwellenwert ${Math.round(result.parameters.targetThreshold ?? result.parameters.threshold)}`,
-        `Glättung ${result.parameters.tolerance.toFixed(2)}`,
-        `${result.parameters.smoothingPasses} Rundungsdurchgang/-gänge`,
-        `Kurvenspannung ${result.parameters.curveTension.toFixed(2)}.`,
-      ].join(', ')
-    : '';
+  const parameterInfo = [
+    result.parameters?.autoOptimize
+      ? ` Automatisch abgeglichen: Schwellenwert ${Math.round(result.parameters.threshold)}`
+      : ` Schwellenwert ${Math.round(result.parameters.threshold)}`,
+    `Speckle-Limit ${result.parameters.speckleThreshold}px`,
+    `Vereinfachung ${result.parameters.tolerance.toFixed(2)}`,
+    `${result.parameters.smoothingPasses} Rundungsdurchgang/-gänge`,
+  ].join(', ');
   statusElement.textContent = `${result.shapeCount} Kontur(en) erkannt. SVG-Größe: ${result.width} × ${result.height}px.${parameterInfo}${comparisonInfo}`;
 
   if (approvedSvg && approvedSvg !== currentSvg) {

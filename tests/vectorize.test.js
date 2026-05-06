@@ -32,12 +32,12 @@ test('creates an evenodd SVG path for a black shape', () => {
   assert.ok(result.height > 0);
 });
 
-test('uses luminance interpolation for subpixel contours', () => {
+test('creates crisp pixel-edge contours for black-and-white sources', () => {
   const imageData = createImageData(2, 1, [black, gray]);
   const result = vectorizeBlackShape(imageData, { threshold: 64, crop: false, tolerance: 0 });
 
-  assert.match(result.pathData, /\d+\.\d+/);
-  assert.ok(result.pathData.includes('0.5'), result.pathData);
+  assert.equal(result.pathData, 'M 0 0 L 1 0 L 1 1 L 0 1 Z');
+  assert.equal(result.comparison.errorRate, 0);
 });
 
 test('returns an empty result when no dark shape is present', () => {
@@ -82,4 +82,27 @@ test('auto optimization compares candidates and chooses the closest image match'
   assert.equal(result.parameters.smoothingPasses, 0);
   assert.equal(result.comparison.errorRate, 0);
   assert.equal(result.comparison.matched, result.comparison.total);
+});
+
+test('removes small speckles before tracing contours', () => {
+  const imageData = createImageData(4, 2, [
+    black,
+    white,
+    black,
+    black,
+    white,
+    white,
+    black,
+    black,
+  ]);
+  const result = vectorizeBlackShape(imageData, {
+    threshold: 64,
+    crop: false,
+    tolerance: 0,
+    speckleThreshold: 2,
+  });
+
+  assert.equal(result.shapeCount, 1);
+  assert.equal(result.pathData, 'M 2 0 L 4 0 L 4 2 L 2 2 Z');
+  assert.equal(result.parameters.speckleThreshold, 2);
 });
