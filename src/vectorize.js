@@ -1,123 +1,209 @@
 const POINT_KEY_SEPARATOR = ',';
+const WHITE_LUMINANCE = 255;
+const KEY_PRECISION = 6;
+const NUMBER_PRECISION = 3;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
-const getPointKey = (x, y) => `${x}${POINT_KEY_SEPARATOR}${y}`;
+const formatNumber = (value) => {
+  const rounded = Number(value.toFixed(NUMBER_PRECISION));
+  return Object.is(rounded, -0) ? '0' : `${rounded}`;
+};
+
+const getPointKey = (x, y) => `${x.toFixed(KEY_PRECISION)}${POINT_KEY_SEPARATOR}${y.toFixed(KEY_PRECISION)}`;
 
 const getPixelIndex = (x, y, width) => y * width + x;
 
-const getBounds = (blackPixels, width, height) => {
-  let minX = width;
-  let minY = height;
-  let maxX = -1;
-  let maxY = -1;
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      if (!blackPixels[getPixelIndex(x, y, width)]) {
-        continue;
-      }
-
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x + 1);
-      maxY = Math.max(maxY, y + 1);
-    }
+const getBounds = (loops) => {
+  if (!loops.length) {
+    return null;
   }
 
-  if (maxX < 0 || maxY < 0) {
-    return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (const loop of loops) {
+    for (const [x, y] of loop) {
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
   }
 
   return { minX, minY, maxX, maxY };
 };
 
-const isBlackAt = (blackPixels, width, height, x, y) => {
-  if (x < 0 || y < 0 || x >= width || y >= height) {
-    return false;
-  }
+const getSampleIndex = (x, y, sampleWidth) => y * sampleWidth + x;
 
-  return blackPixels[getPixelIndex(x, y, width)];
-};
-
-const addEdge = (edgesByStart, startX, startY, endX, endY) => {
-  const startKey = getPointKey(startX, startY);
-  const edge = {
-    startKey,
-    endKey: getPointKey(endX, endY),
-    start: [startX, startY],
-    end: [endX, endY],
-    used: false,
-  };
-
-  if (!edgesByStart.has(startKey)) {
-    edgesByStart.set(startKey, []);
-  }
-
-  edgesByStart.get(startKey).push(edge);
-};
-
-const buildBoundaryEdges = (blackPixels, width, height) => {
-  const edgesByStart = new Map();
-  const edges = [];
-
-  const pushEdge = (startX, startY, endX, endY) => {
-    addEdge(edgesByStart, startX, startY, endX, endY);
-    edges.push(edgesByStart.get(getPointKey(startX, startY)).at(-1));
-  };
+const createLuminanceSamples = (imageData, threshold) => {
+  const { data, width, height } = imageData;
+  const sampleWidth = width + 2;
+  const sampleHeight = height + 2;
+  const samples = new Float32Array(sampleWidth * sampleHeight);
+  samples.fill(WHITE_LUMINANCE);
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      if (!isBlackAt(blackPixels, width, height, x, y)) {
+      const dataIndex = getPixelIndex(x, y, width) * 4;
+      const alpha = data[dataIndex + 3] / 255;
+      const luminance =
+        0.2126 * data[dataIndex] + 0.7152 * data[dataIndex + 1] + 0.0722 * data[dataIndex + 2];
+      const alphaAdjustedLuminance = alpha * luminance + (1 - alpha) * WHITE_LUMINANCE;
+
+      samples[getSampleIndex(x + 1, y + 1, sampleWidth)] = alphaAdjustedLuminance;
+    }
+  }
+
+  return {
+    samples,
+    sampleWidth,
+    threshold: clamp(Number(threshold) || 128, 0, 255),
+  };
+};
+
+const interpolate = (from, to, threshold) => {
+  const delta = to.value - from.value;
+  const ratio = delta === 0 ? 0.5 : clamp((threshold - from.value) / delta, 0, 1);
+
+  return [from.x + (to.x - from.x) * ratio, from.y + (to.y - from.y) * ratio];
+};
+
+const createSamplePoint = (samples, sampleWidth, x, y) => ({
+  x: x - 0.5,
+  y: y - 0.5,
+  value: samples[getSampleIndex(x, y, sampleWidth)],
+});
+
+const addSegment = (segments, first, second) => {
+  if (first[0] === second[0] && first[1] === second[1]) {
+    return;
+  }
+
+  segments.push({
+    a: first,
+    b: second,
+    aKey: getPointKey(first[0], first[1]),
+    bKey: getPointKey(second[0], second[1]),
+    used: false,
+  });
+};
+
+const buildContourSegments = (imageData, options = {}) => {
+  const { width, height } = imageData;
+  const { samples, sampleWidth, threshold } = createLuminanceSamples(imageData, options.threshold);
+  const segments = [];
+
+  for (let y = 0; y < height + 1; y += 1) {
+    for (let x = 0; x < width + 1; x += 1) {
+      const topLeft = createSamplePoint(samples, sampleWidth, x, y);
+      const topRight = createSamplePoint(samples, sampleWidth, x + 1, y);
+      const bottomRight = createSamplePoint(samples, sampleWidth, x + 1, y + 1);
+      const bottomLeft = createSamplePoint(samples, sampleWidth, x, y + 1);
+      const insideTopLeft = topLeft.value <= threshold;
+      const insideTopRight = topRight.value <= threshold;
+      const insideBottomRight = bottomRight.value <= threshold;
+      const insideBottomLeft = bottomLeft.value <= threshold;
+      const caseIndex =
+        (insideTopLeft ? 1 : 0) |
+        (insideTopRight ? 2 : 0) |
+        (insideBottomRight ? 4 : 0) |
+        (insideBottomLeft ? 8 : 0);
+
+      if (caseIndex === 0 || caseIndex === 15) {
         continue;
       }
 
-      if (!isBlackAt(blackPixels, width, height, x, y - 1)) {
-        pushEdge(x, y, x + 1, y);
-      }
-      if (!isBlackAt(blackPixels, width, height, x + 1, y)) {
-        pushEdge(x + 1, y, x + 1, y + 1);
-      }
-      if (!isBlackAt(blackPixels, width, height, x, y + 1)) {
-        pushEdge(x + 1, y + 1, x, y + 1);
-      }
-      if (!isBlackAt(blackPixels, width, height, x - 1, y)) {
-        pushEdge(x, y + 1, x, y);
+      const edgePoints = {
+        top: interpolate(topLeft, topRight, threshold),
+        right: interpolate(topRight, bottomRight, threshold),
+        bottom: interpolate(bottomLeft, bottomRight, threshold),
+        left: interpolate(topLeft, bottomLeft, threshold),
+      };
+
+      const segmentSpecs = {
+        1: [['left', 'top']],
+        2: [['top', 'right']],
+        3: [['left', 'right']],
+        4: [['right', 'bottom']],
+        5: [['left', 'top'], ['right', 'bottom']],
+        6: [['top', 'bottom']],
+        7: [['left', 'bottom']],
+        8: [['bottom', 'left']],
+        9: [['top', 'bottom']],
+        10: [['top', 'right'], ['bottom', 'left']],
+        11: [['right', 'bottom']],
+        12: [['left', 'right']],
+        13: [['top', 'right']],
+        14: [['left', 'top']],
+      };
+
+      for (const [firstEdge, secondEdge] of segmentSpecs[caseIndex]) {
+        addSegment(segments, edgePoints[firstEdge], edgePoints[secondEdge]);
       }
     }
   }
 
-  return { edges, edgesByStart };
+  return segments;
 };
 
-const popNextUnusedEdge = (edgesByStart, startKey) => {
-  const candidates = edgesByStart.get(startKey) || [];
-  return candidates.find((edge) => !edge.used) || null;
+const buildSegmentIndex = (segments) => {
+  const segmentsByPoint = new Map();
+
+  const addToIndex = (pointKey, segment) => {
+    if (!segmentsByPoint.has(pointKey)) {
+      segmentsByPoint.set(pointKey, []);
+    }
+
+    segmentsByPoint.get(pointKey).push(segment);
+  };
+
+  for (const segment of segments) {
+    addToIndex(segment.aKey, segment);
+    addToIndex(segment.bKey, segment);
+  }
+
+  return segmentsByPoint;
 };
 
-const traceLoops = (edges, edgesByStart) => {
+const getNextSegment = (segmentsByPoint, currentKey) => {
+  const candidates = segmentsByPoint.get(currentKey) || [];
+  return candidates.find((segment) => !segment.used) || null;
+};
+
+const getOtherEndpoint = (segment, pointKey) =>
+  segment.aKey === pointKey ? { point: segment.b, key: segment.bKey } : { point: segment.a, key: segment.aKey };
+
+const traceLoops = (segments) => {
   const loops = [];
+  const segmentsByPoint = buildSegmentIndex(segments);
 
-  for (const edge of edges) {
-    if (edge.used) {
+  for (const segment of segments) {
+    if (segment.used) {
       continue;
     }
 
-    const points = [edge.start];
-    let currentEdge = edge;
+    const points = [segment.a];
+    const startKey = segment.aKey;
+    let currentSegment = segment;
+    let currentKey = segment.aKey;
 
-    while (currentEdge && !currentEdge.used) {
-      currentEdge.used = true;
-      points.push(currentEdge.end);
+    while (currentSegment && !currentSegment.used) {
+      currentSegment.used = true;
+      const next = getOtherEndpoint(currentSegment, currentKey);
+      points.push(next.point);
+      currentKey = next.key;
 
-      if (currentEdge.endKey === edge.startKey) {
+      if (currentKey === startKey) {
         break;
       }
 
-      currentEdge = popNextUnusedEdge(edgesByStart, currentEdge.endKey);
+      currentSegment = getNextSegment(segmentsByPoint, currentKey);
     }
 
-    if (points.length > 3 && points.at(-1)[0] === points[0][0] && points.at(-1)[1] === points[0][1]) {
+    if (points.length > 3 && currentKey === startKey) {
       loops.push(points);
     }
   }
@@ -194,10 +280,10 @@ const loopsToPathData = (loops, { offsetX = 0, offsetY = 0, tolerance = 1 } = {}
     .map((loop) => simplifyClosedLoop(loop, tolerance))
     .map((loop) => {
       const [firstX, firstY] = loop[0];
-      const commands = [`M ${firstX - offsetX} ${firstY - offsetY}`];
+      const commands = [`M ${formatNumber(firstX - offsetX)} ${formatNumber(firstY - offsetY)}`];
 
       for (const [x, y] of loop.slice(1, -1)) {
-        commands.push(`L ${x - offsetX} ${y - offsetY}`);
+        commands.push(`L ${formatNumber(x - offsetX)} ${formatNumber(y - offsetY)}`);
       }
 
       commands.push('Z');
@@ -205,26 +291,11 @@ const loopsToPathData = (loops, { offsetX = 0, offsetY = 0, tolerance = 1 } = {}
     })
     .join(' ');
 
-const createBlackPixelMask = (imageData, threshold) => {
-  const { data, width, height } = imageData;
-  const blackPixels = new Uint8Array(width * height);
-  const normalizedThreshold = clamp(Number(threshold) || 128, 0, 255);
-
-  for (let pixel = 0; pixel < blackPixels.length; pixel += 1) {
-    const dataIndex = pixel * 4;
-    const alpha = data[dataIndex + 3];
-    const luminance = 0.2126 * data[dataIndex] + 0.7152 * data[dataIndex + 1] + 0.0722 * data[dataIndex + 2];
-
-    blackPixels[pixel] = alpha > 0 && luminance <= normalizedThreshold ? 1 : 0;
-  }
-
-  return blackPixels;
-};
-
 export const vectorizeBlackShape = (imageData, options = {}) => {
   const { width, height } = imageData;
-  const blackPixels = createBlackPixelMask(imageData, options.threshold);
-  const bounds = getBounds(blackPixels, width, height);
+  const segments = buildContourSegments(imageData, options);
+  const loops = traceLoops(segments);
+  const bounds = getBounds(loops);
 
   if (!bounds) {
     return {
@@ -237,8 +308,6 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
     };
   }
 
-  const { edges, edgesByStart } = buildBoundaryEdges(blackPixels, width, height);
-  const loops = traceLoops(edges, edgesByStart);
   const crop = options.crop !== false;
   const offsetX = crop ? bounds.minX : 0;
   const offsetY = crop ? bounds.minY : 0;
@@ -249,9 +318,11 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
     offsetY,
     tolerance: Math.max(0, Number(options.tolerance) || 0),
   });
-  const viewBox = `0 0 ${svgWidth} ${svgHeight}`;
+  const viewBox = `0 0 ${formatNumber(svgWidth)} ${formatNumber(svgHeight)}`;
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="${viewBox}">
+<svg xmlns="http://www.w3.org/2000/svg" width="${formatNumber(svgWidth)}" height="${formatNumber(
+    svgHeight,
+  )}" viewBox="${viewBox}">
   <path d="${pathData}" fill="#000000" fill-rule="evenodd"/>
 </svg>`;
 

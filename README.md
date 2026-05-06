@@ -9,6 +9,8 @@ Diese Browser-App wandelt ein hochgeladenes Schwarz-Weiß-Bild in eine SVG-Datei
 
 Die SVG enthält keine eingebettete Rastergrafik, sondern einen echten `<path>` mit `fill="#000000"` und `fill-rule="evenodd"`, damit auch weiße Aussparungen innerhalb der schwarzen Form erhalten bleiben.
 
+Die Kontur wird subpixelgenau aus den Helligkeitswerten berechnet. Dadurch werden Anti-Aliasing-Kanten deutlich sauberer nachgezeichnet als mit einer reinen Pixel-Treppen-Kontur.
+
 ## Starten
 
 Da der Browser ES-Module lädt, bitte über einen lokalen Webserver starten:
@@ -23,9 +25,19 @@ Dann öffnen: <http://localhost:8080>
 
 1. Über **Schwarz-Weiß-Bild** eine PNG/JPG/WebP-Datei auswählen.
 2. Falls zu viel oder zu wenig erkannt wird, den **Schwellenwert für Schwarz** anpassen.
-3. Mit **Glättung** die Anzahl der Stützpunkte reduzieren. `0` exportiert pixelgenau, höhere Werte glätten stärker.
+3. Mit **Glättung** die Anzahl der Stützpunkte reduzieren. `0` exportiert maximal detailgetreu; empfohlen ist ein kleiner Wert wie `0.15`, der nur minimales Zittern entfernt. Höhere Werte glätten stärker.
 4. **SVG exportieren** lädt die erzeugte Datei `schwarze-form.svg` herunter.
 5. **SVG freigeben & weiter** löst weiterhin das Integrations-Event aus.
+
+## Code prüfen
+
+Vor Änderungen oder vor dem Weitergeben kannst du Syntax und Vektorisierungs-Tests ausführen:
+
+```bash
+npm run check
+```
+
+Der Check prüft `src/app.js` und `src/vectorize.js` syntaktisch und testet die SVG-Vektorisierung mit Node.js.
 
 ## Integrationspunkt für das Gesamtsystem
 
