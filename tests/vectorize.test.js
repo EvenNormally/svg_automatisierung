@@ -49,7 +49,7 @@ test('returns an empty result when no dark shape is present', () => {
   assert.equal(result.viewBox, '0 0 0 0');
 });
 
-test('auto optimization chooses smooth cubic paths and ignores manual rough defaults', () => {
+test('auto optimization compares candidates and chooses the closest image match', () => {
   const imageData = createImageData(4, 4, [
     white,
     white,
@@ -78,6 +78,8 @@ test('auto optimization chooses smooth cubic paths and ignores manual rough defa
   assert.equal(result.shapeCount, 1);
   assert.equal(result.parameters.autoOptimize, true);
   assert.ok(result.parameters.threshold > 0, result.parameters);
-  assert.ok(result.parameters.tolerance > 0, result.parameters);
-  assert.match(result.pathData, / C /);
+  assert.equal(result.parameters.tolerance, 0);
+  assert.equal(result.parameters.smoothingPasses, 0);
+  assert.equal(result.comparison.errorRate, 0);
+  assert.equal(result.comparison.matched, result.comparison.total);
 });
