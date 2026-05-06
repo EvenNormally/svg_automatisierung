@@ -48,3 +48,50 @@ test('returns an empty result when no dark shape is present', () => {
   assert.equal(result.shapeCount, 0);
   assert.equal(result.viewBox, '0 0 0 0');
 });
+
+test('auto optimization chooses safer matching defaults and ignores manual rough defaults', () => {
+  const imageData = createImageData(4, 4, [
+    white,
+    white,
+    white,
+    white,
+    white,
+    black,
+    black,
+    white,
+    white,
+    black,
+    black,
+    white,
+    white,
+    white,
+    white,
+    white,
+  ]);
+  const result = vectorizeBlackShape(imageData, {
+    autoOptimize: true,
+    threshold: 0,
+    tolerance: 0,
+    crop: false,
+  });
+
+  assert.equal(result.shapeCount, 1);
+  assert.equal(result.parameters.autoOptimize, true);
+  assert.ok(result.parameters.threshold > 0, result.parameters);
+  assert.ok(result.parameters.tolerance > 0, result.parameters);
+  assert.equal(result.parameters.pathMode, 'line');
+  assert.match(result.pathData, / L /);
+});
+
+test('can still emit cubic paths when curve mode wins a preview comparison', () => {
+  const imageData = createImageData(3, 3, [white, white, white, white, black, white, white, white, white]);
+  const result = vectorizeBlackShape(imageData, {
+    threshold: 200,
+    tolerance: 0,
+    smoothingPasses: 0,
+    pathMode: 'curve',
+  });
+
+  assert.match(result.pathData, / C /);
+  assert.equal(result.parameters.pathMode, 'curve');
+});
