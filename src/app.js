@@ -1,169 +1,121 @@
-import { downloadSvg } from './export.js';
-import { vectorizeBlackShape } from './vectorize.js';
-
-const form = document.querySelector('#parameter-form');
+const form = document.querySelector('#converter-form');
 const fileInput = document.querySelector('#image-file');
-const previewElement = document.querySelector('#preview');
+const convertButton = document.querySelector('#convert-btn');
+const downloadButton = document.querySelector('#download-btn');
 const statusElement = document.querySelector('#status');
+const previewElement = document.querySelector('#preview');
 const svgCodeElement = document.querySelector('#svg-code');
-const exportButton = document.querySelector('#export-btn');
-const approveButton = document.querySelector('#approve-btn');
-const uploadedImage = document.querySelector('#uploaded-image');
+const fileNameElement = document.querySelector('#file-name');
 
-let currentSvg = '';
-let currentParams = {};
-let approvedSvg = '';
-let currentImage = null;
+let convertedSvg = '';
+let convertedFileName = 'converted.svg';
 
-const readFormState = () => {
-  const data = new FormData(form);
-  const params = Object.fromEntries(data.entries());
-
-  return {
-    ...params,
-    autoOptimize: data.has('autoOptimize'),
-    crop: data.has('crop'),
-  };
+const setStatus = (message, type = 'info') => {
+  statusElement.textContent = message;
+  statusElement.dataset.type = type;
 };
 
-const syncParameterControlState = () => {
-  const formData = new FormData(form);
-  const autoOptimize = formData.has('autoOptimize');
+const setBusy = (busy) => {
+  convertButton.disabled = busy || !fileInput.files?.length;
+  fileInput.disabled = busy;
+};
 
-  for (const field of form.querySelectorAll('[name="threshold"]')) {
-    field.disabled = autoOptimize;
+const resetResult = () => {
+  convertedSvg = '';
+  convertedFileName = 'converted.svg';
+  downloadButton.disabled = true;
+  previewElement.innerHTML = '<p class="empty-state">Noch keine SVG-Datei konvertiert.</p>';
+  svgCodeElement.textContent = '';
+};
+
+const ensureSvgMarkup = (markup) => {
+  if (!markup.includes('<svg')) {
+    throw new Error('Die heruntergeladene Datei enthält kein SVG-Markup.');
   }
+
+  return markup.trim();
 };
 
-const setActionState = (enabled) => {
-  exportButton.disabled = !enabled;
-  approveButton.disabled = !enabled;
+const renderSvg = (markup) => {
+  convertedSvg = ensureSvgMarkup(markup);
+  previewElement.innerHTML = convertedSvg;
+  svgCodeElement.textContent = convertedSvg;
+  downloadButton.disabled = false;
 };
 
-const writeOptimizedParametersToForm = (parameters = {}) => {
-  const thresholdInput = form.elements.threshold;
-  if (thresholdInput && Number.isFinite(Number(parameters.threshold))) {
-    thresholdInput.value = Math.round(parameters.threshold);
-  }
-};
-
-const getImageData = (image) => {
-  const canvas = document.createElement('canvas');
-  canvas.width = image.naturalWidth;
-  canvas.height = image.naturalHeight;
-
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-  context.drawImage(image, 0, 0);
-
-  return context.getImageData(0, 0, canvas.width, canvas.height);
-};
-
-const render = () => {
-  syncParameterControlState();
-  currentParams = readFormState();
-
-  if (!currentImage) {
-    currentSvg = '';
-    previewElement.innerHTML = '<p class="empty-state">Bitte lade ein Schwarz-Weiß-Bild hoch.</p>';
-    svgCodeElement.textContent = '';
-    setActionState(false);
+const downloadConvertedSvg = () => {
+  if (!convertedSvg) {
     return;
   }
 
-  const result = vectorizeBlackShape(getImageData(currentImage), currentParams);
-  currentSvg = result.svg;
-
-  if (result.parameters?.autoOptimize) {
-    writeOptimizedParametersToForm(result.parameters);
-  }
-
-  previewElement.innerHTML = currentSvg || '<p class="empty-state">Keine schwarze Form erkannt.</p>';
-  svgCodeElement.textContent = currentSvg;
-  setActionState(Boolean(currentSvg));
-
-  if (!currentSvg) {
-    statusElement.textContent = 'Keine schwarze Form erkannt. Erhöhe den Schwellenwert oder prüfe das Bild.';
-    return;
-  }
-
-  const comparisonInfo = result.comparison
-    ? ` Abgleich: ${((1 - result.comparison.errorRate) * 100).toFixed(1)}% Pixel-Übereinstimmung (${result.comparison.matched}/${result.comparison.total} Stichproben).`
-    : '';
-  const parameterInfo = [
-    result.parameters?.autoOptimize
-      ? ` Automatisch abgeglichen: Schwellenwert ${Math.round(result.parameters.threshold)}`
-      : ` Schwellenwert ${Math.round(result.parameters.threshold)}`,
-    `Speckle-Limit ${result.parameters.speckleThreshold}px`,
-    `Vereinfachung ${result.parameters.tolerance.toFixed(2)}`,
-    `${result.parameters.smoothingPasses} Rundungsdurchgang/-gänge`,
-  ].join(', ');
-  statusElement.textContent = `${result.shapeCount} Kontur(en) erkannt. SVG-Größe: ${result.width} × ${result.height}px.${parameterInfo}${comparisonInfo}`;
-
-  if (approvedSvg && approvedSvg !== currentSvg) {
-    statusElement.textContent =
-      'Bild oder Einstellungen geändert. Bitte SVG erneut freigeben, bevor der nächste Prozessschritt startet.';
-  }
+  const blob = new Blob([convertedSvg], { type: 'image/svg+xml;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = convertedFileName;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 };
 
-const loadSelectedImage = (file) => {
+const convertSelectedFile = async () => {
+  const file = fileInput.files?.[0];
+
   if (!file) {
-    currentImage = null;
-    render();
+    setStatus('Bitte wähle zuerst eine PNG-Datei aus.', 'error');
     return;
   }
 
-  const imageUrl = URL.createObjectURL(file);
-  uploadedImage.onload = () => {
-    URL.revokeObjectURL(imageUrl);
-    currentImage = uploadedImage;
-    approvedSvg = '';
-    render();
-  };
-  uploadedImage.onerror = () => {
-    URL.revokeObjectURL(imageUrl);
-    currentImage = null;
-    statusElement.textContent = 'Das Bild konnte nicht geladen werden.';
-    render();
-  };
-  uploadedImage.src = imageUrl;
-};
+  resetResult();
+  setBusy(true);
+  setStatus(
+    'Bild wird zu Online-Convert hochgeladen. Die Konvertierung kann je nach Dateigröße etwas dauern …',
+  );
 
-const startNextStep = ({ svg, params }) => {
-  const event = new CustomEvent('svg-approved', {
-    detail: {
-      svg,
-      params,
-      approvedAt: new Date().toISOString(),
-    },
-  });
+  try {
+    const payload = new FormData();
+    payload.append('image', file);
 
-  window.dispatchEvent(event);
+    const response = await fetch('/api/convert', {
+      method: 'POST',
+      body: payload,
+    });
 
-  // TODO: Integriere hier den Aufruf des nächsten Workflowschritts, z. B. API-Request.
+    const result = await response.json();
+
+    if (!response.ok) {
+      throw new Error(result.error || 'Die Konvertierung ist fehlgeschlagen.');
+    }
+
+    convertedFileName = result.filename || file.name.replace(/\.png$/i, '.svg') || 'converted.svg';
+    renderSvg(result.svg);
+    setStatus(`SVG wurde von Online-Convert heruntergeladen: ${convertedFileName}`, 'success');
+  } catch (error) {
+    resetResult();
+    setStatus(error.message, 'error');
+  } finally {
+    setBusy(false);
+  }
 };
 
 fileInput.addEventListener('change', () => {
-  loadSelectedImage(fileInput.files?.[0]);
+  resetResult();
+  convertButton.disabled = !fileInput.files?.length;
+  fileNameElement.textContent = fileInput.files?.[0]?.name || 'Keine Datei ausgewählt';
+
+  if (fileInput.files?.length) {
+    setStatus('Bereit zum Hochladen auf Online-Convert.');
+  }
 });
 
-form.addEventListener('input', render);
-
-exportButton.addEventListener('click', () => {
-  downloadSvg({ markup: currentSvg, filename: 'schwarze-form.svg' });
-  statusElement.textContent = 'SVG wurde als Datei exportiert.';
+form.addEventListener('submit', (event) => {
+  event.preventDefault();
+  convertSelectedFile();
 });
 
-approveButton.addEventListener('click', () => {
-  approvedSvg = currentSvg;
-  statusElement.textContent =
-    'SVG freigegeben. Nachgelagerter Prozess kann jetzt mit genau diesem SVG weiterlaufen.';
+downloadButton.addEventListener('click', downloadConvertedSvg);
 
-  startNextStep({ svg: approvedSvg, params: currentParams });
-});
-
-window.addEventListener('svg-approved', (event) => {
-  console.debug('SVG-Freigabe-Event für Systemintegration:', event.detail);
-});
-
-setActionState(false);
-render();
+resetResult();
+setBusy(false);
+setStatus('Wähle eine PNG-Datei aus, um sie über Online-Convert in SVG umzuwandeln.');
