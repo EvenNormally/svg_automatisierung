@@ -48,3 +48,36 @@ test('returns an empty result when no dark shape is present', () => {
   assert.equal(result.shapeCount, 0);
   assert.equal(result.viewBox, '0 0 0 0');
 });
+
+test('auto optimization chooses smooth cubic paths and ignores manual rough defaults', () => {
+  const imageData = createImageData(4, 4, [
+    white,
+    white,
+    white,
+    white,
+    white,
+    black,
+    black,
+    white,
+    white,
+    black,
+    black,
+    white,
+    white,
+    white,
+    white,
+    white,
+  ]);
+  const result = vectorizeBlackShape(imageData, {
+    autoOptimize: true,
+    threshold: 0,
+    tolerance: 0,
+    crop: false,
+  });
+
+  assert.equal(result.shapeCount, 1);
+  assert.equal(result.parameters.autoOptimize, true);
+  assert.ok(result.parameters.threshold > 0, result.parameters);
+  assert.ok(result.parameters.tolerance > 0, result.parameters);
+  assert.match(result.pathData, / C /);
+});
