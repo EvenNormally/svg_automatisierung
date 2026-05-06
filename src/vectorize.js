@@ -2,6 +2,9 @@ const POINT_KEY_SEPARATOR = ',';
 const WHITE_LUMINANCE = 255;
 const KEY_PRECISION = 6;
 const NUMBER_PRECISION = 3;
+const HISTOGRAM_SIZE = 256;
+const MIN_CONTRAST = 12;
+const DEFAULT_CURVE_TENSION = 0.9;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -13,6 +16,93 @@ const formatNumber = (value) => {
 const getPointKey = (x, y) => `${x.toFixed(KEY_PRECISION)}${POINT_KEY_SEPARATOR}${y.toFixed(KEY_PRECISION)}`;
 
 const getPixelIndex = (x, y, width) => y * width + x;
+
+const getPixelLuminance = (data, pixelIndex) => {
+  const dataIndex = pixelIndex * 4;
+  const alpha = data[dataIndex + 3] / 255;
+  const luminance = 0.2126 * data[dataIndex] + 0.7152 * data[dataIndex + 1] + 0.0722 * data[dataIndex + 2];
+
+  return alpha * luminance + (1 - alpha) * WHITE_LUMINANCE;
+};
+
+const getPercentileFromHistogram = (histogram, total, percentile) => {
+  const target = Math.max(0, Math.min(total - 1, Math.floor((total - 1) * percentile)));
+  let seen = 0;
+
+  for (let value = 0; value < histogram.length; value += 1) {
+    seen += histogram[value];
+
+    if (seen > target) {
+      return value;
+    }
+  }
+
+  return histogram.length - 1;
+};
+
+const getOtsuThreshold = (histogram, total) => {
+  let weightedSum = 0;
+
+  for (let value = 0; value < histogram.length; value += 1) {
+    weightedSum += value * histogram[value];
+  }
+
+  let backgroundWeight = 0;
+  let backgroundSum = 0;
+  let bestThreshold = 128;
+  let bestVariance = -1;
+
+  for (let value = 0; value < histogram.length; value += 1) {
+    backgroundWeight += histogram[value];
+
+    if (backgroundWeight === 0) {
+      continue;
+    }
+
+    const foregroundWeight = total - backgroundWeight;
+
+    if (foregroundWeight === 0) {
+      break;
+    }
+
+    backgroundSum += value * histogram[value];
+    const backgroundMean = backgroundSum / backgroundWeight;
+    const foregroundMean = (weightedSum - backgroundSum) / foregroundWeight;
+    const betweenClassVariance = backgroundWeight * foregroundWeight * (backgroundMean - foregroundMean) ** 2;
+
+    if (betweenClassVariance > bestVariance) {
+      bestVariance = betweenClassVariance;
+      bestThreshold = value;
+    }
+  }
+
+  return bestThreshold;
+};
+
+const estimateAutoParameters = (imageData) => {
+  const { data, width, height } = imageData;
+  const histogram = new Uint32Array(HISTOGRAM_SIZE);
+  const total = width * height;
+
+  for (let pixelIndex = 0; pixelIndex < total; pixelIndex += 1) {
+    histogram[Math.round(getPixelLuminance(data, pixelIndex))] += 1;
+  }
+
+  const low = getPercentileFromHistogram(histogram, total, 0.05);
+  const high = getPercentileFromHistogram(histogram, total, 0.95);
+  const contrast = high - low;
+  const threshold = contrast >= MIN_CONTRAST ? (low + high) / 2 : getOtsuThreshold(histogram, total);
+  const longestSide = Math.max(width, height);
+  const tolerance = clamp(longestSide * 0.0025, 0.35, 2.2);
+  const smoothingPasses = longestSide >= 300 ? 2 : 1;
+
+  return {
+    threshold: clamp(threshold, 0, 255),
+    tolerance,
+    smoothingPasses,
+    curveTension: DEFAULT_CURVE_TENSION,
+  };
+};
 
 const getBounds = (loops) => {
   if (!loops.length) {
@@ -47,20 +137,17 @@ const createLuminanceSamples = (imageData, threshold) => {
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      const dataIndex = getPixelIndex(x, y, width) * 4;
-      const alpha = data[dataIndex + 3] / 255;
-      const luminance =
-        0.2126 * data[dataIndex] + 0.7152 * data[dataIndex + 1] + 0.0722 * data[dataIndex + 2];
-      const alphaAdjustedLuminance = alpha * luminance + (1 - alpha) * WHITE_LUMINANCE;
-
-      samples[getSampleIndex(x + 1, y + 1, sampleWidth)] = alphaAdjustedLuminance;
+      samples[getSampleIndex(x + 1, y + 1, sampleWidth)] = getPixelLuminance(
+        data,
+        getPixelIndex(x, y, width),
+      );
     }
   }
 
   return {
     samples,
     sampleWidth,
-    threshold: clamp(Number(threshold) || 128, 0, 255),
+    threshold: clamp(Number(threshold ?? 128), 0, 255),
   };
 };
 
@@ -275,25 +362,91 @@ const simplifyClosedLoop = (loop, tolerance) => {
     : simplified.concat([first]);
 };
 
-const loopsToPathData = (loops, { offsetX = 0, offsetY = 0, tolerance = 1 } = {}) =>
+const stripClosingPoint = (loop) => {
+  const first = loop[0];
+  const last = loop.at(-1);
+
+  return first && last && first[0] === last[0] && first[1] === last[1] ? loop.slice(0, -1) : loop.slice();
+};
+
+const chaikinSmoothClosedLoop = (loop, passes) => {
+  let points = stripClosingPoint(loop);
+
+  for (let pass = 0; pass < passes && points.length >= 4; pass += 1) {
+    const smoothed = [];
+
+    for (let index = 0; index < points.length; index += 1) {
+      const current = points[index];
+      const next = points[(index + 1) % points.length];
+      smoothed.push([
+        current[0] * 0.75 + next[0] * 0.25,
+        current[1] * 0.75 + next[1] * 0.25,
+      ]);
+      smoothed.push([
+        current[0] * 0.25 + next[0] * 0.75,
+        current[1] * 0.25 + next[1] * 0.75,
+      ]);
+    }
+
+    points = smoothed;
+  }
+
+  return points;
+};
+
+const loopToCubicPathData = (loop, { offsetX, offsetY, curveTension }) => {
+  const points = stripClosingPoint(loop);
+
+  if (points.length < 3) {
+    return '';
+  }
+
+  const commands = [`M ${formatNumber(points[0][0] - offsetX)} ${formatNumber(points[0][1] - offsetY)}`];
+  const tension = clamp(Number(curveTension) || DEFAULT_CURVE_TENSION, 0, 1.5);
+
+  for (let index = 0; index < points.length; index += 1) {
+    const previous = points[(index - 1 + points.length) % points.length];
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    const afterNext = points[(index + 2) % points.length];
+    const control1 = [
+      current[0] + ((next[0] - previous[0]) * tension) / 6,
+      current[1] + ((next[1] - previous[1]) * tension) / 6,
+    ];
+    const control2 = [
+      next[0] - ((afterNext[0] - current[0]) * tension) / 6,
+      next[1] - ((afterNext[1] - current[1]) * tension) / 6,
+    ];
+
+    commands.push(
+      `C ${formatNumber(control1[0] - offsetX)} ${formatNumber(control1[1] - offsetY)} ${formatNumber(
+        control2[0] - offsetX,
+      )} ${formatNumber(control2[1] - offsetY)} ${formatNumber(next[0] - offsetX)} ${formatNumber(
+        next[1] - offsetY,
+      )}`,
+    );
+  }
+
+  commands.push('Z');
+  return commands.join(' ');
+};
+
+const loopsToPathData = (
+  loops,
+  { offsetX = 0, offsetY = 0, tolerance = 1, smoothingPasses = 0, curveTension = DEFAULT_CURVE_TENSION } = {},
+) =>
   loops
     .map((loop) => simplifyClosedLoop(loop, tolerance))
-    .map((loop) => {
-      const [firstX, firstY] = loop[0];
-      const commands = [`M ${formatNumber(firstX - offsetX)} ${formatNumber(firstY - offsetY)}`];
-
-      for (const [x, y] of loop.slice(1, -1)) {
-        commands.push(`L ${formatNumber(x - offsetX)} ${formatNumber(y - offsetY)}`);
-      }
-
-      commands.push('Z');
-      return commands.join(' ');
-    })
+    .map((loop) => chaikinSmoothClosedLoop(loop, Math.max(0, Number(smoothingPasses) || 0)))
+    .map((loop) => loopToCubicPathData(loop, { offsetX, offsetY, curveTension }))
+    .filter(Boolean)
     .join(' ');
 
 export const vectorizeBlackShape = (imageData, options = {}) => {
   const { width, height } = imageData;
-  const segments = buildContourSegments(imageData, options);
+  const autoParameters = options.autoOptimize ? estimateAutoParameters(imageData) : {};
+  const resolvedOptions = { ...options, ...autoParameters };
+  const segments = buildContourSegments(imageData, resolvedOptions);
   const loops = traceLoops(segments);
   const bounds = getBounds(loops);
 
@@ -305,6 +458,7 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
       height: 0,
       viewBox: '0 0 0 0',
       shapeCount: 0,
+      parameters: { ...autoParameters },
     };
   }
 
@@ -316,7 +470,9 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
   const pathData = loopsToPathData(loops, {
     offsetX,
     offsetY,
-    tolerance: Math.max(0, Number(options.tolerance) || 0),
+    tolerance: Math.max(0, Number(resolvedOptions.tolerance) || 0),
+    smoothingPasses: Math.max(0, Number(resolvedOptions.smoothingPasses) || 0),
+    curveTension: resolvedOptions.curveTension,
   });
   const viewBox = `0 0 ${formatNumber(svgWidth)} ${formatNumber(svgHeight)}`;
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
@@ -333,5 +489,12 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
     height: svgHeight,
     viewBox,
     shapeCount: loops.length,
+    parameters: {
+      threshold: resolvedOptions.threshold,
+      tolerance: Math.max(0, Number(resolvedOptions.tolerance) || 0),
+      smoothingPasses: Math.max(0, Number(resolvedOptions.smoothingPasses) || 0),
+      curveTension: resolvedOptions.curveTension ?? DEFAULT_CURVE_TENSION,
+      autoOptimize: Boolean(options.autoOptimize),
+    },
   };
 };

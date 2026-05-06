@@ -21,8 +21,18 @@ const readFormState = () => {
 
   return {
     ...params,
+    autoOptimize: data.has('autoOptimize'),
     crop: data.has('crop'),
   };
+};
+
+const syncParameterControlState = () => {
+  const formData = new FormData(form);
+  const autoOptimize = formData.has('autoOptimize');
+
+  for (const field of form.querySelectorAll('[name="threshold"], [name="tolerance"]')) {
+    field.disabled = autoOptimize;
+  }
 };
 
 const setActionState = (enabled) => {
@@ -42,6 +52,7 @@ const getImageData = (image) => {
 };
 
 const render = () => {
+  syncParameterControlState();
   currentParams = readFormState();
 
   if (!currentImage) {
@@ -64,7 +75,14 @@ const render = () => {
     return;
   }
 
-  statusElement.textContent = `${result.shapeCount} Kontur(en) erkannt. SVG-Größe: ${result.width} × ${result.height}px.`;
+  const parameterInfo = result.parameters?.autoOptimize
+    ? [
+        ` Automatisch: Schwellenwert ${Math.round(result.parameters.threshold)}`,
+        `Glättung ${result.parameters.tolerance.toFixed(2)}`,
+        `${result.parameters.smoothingPasses} Rundungsdurchgang/-gänge.`,
+      ].join(', ')
+    : '';
+  statusElement.textContent = `${result.shapeCount} Kontur(en) erkannt. SVG-Größe: ${result.width} × ${result.height}px.${parameterInfo}`;
 
   if (approvedSvg && approvedSvg !== currentSvg) {
     statusElement.textContent =
