@@ -59,9 +59,13 @@ input {
   font: inherit;
 }
 
-input[type='color'] {
-  min-height: 2.3rem;
-  padding: 0.2rem;
+input[type='file'] {
+  padding: 0.45rem 0.6rem;
+}
+
+input[type='range'] {
+  padding-left: 0;
+  padding-right: 0;
 }
 
 .actions {
@@ -85,7 +89,12 @@ button.primary {
   color: #fff;
 }
 
-button:hover {
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+button:hover:not(:disabled) {
   filter: brightness(0.98);
 }
 
@@ -108,6 +117,26 @@ button:hover {
   place-items: center;
   overflow: auto;
   padding: 1rem;
+}
+
+.empty-state {
+  color: var(--text-muted);
+  margin: 0;
+  text-align: center;
+}
+
+.full-width {
+  grid-column: 1 / -1;
+}
+
+.checkbox-row {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.checkbox-row input {
+  width: auto;
 }
 
 .preview-box svg {
