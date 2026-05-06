@@ -5,6 +5,8 @@ const NUMBER_PRECISION = 3;
 const HISTOGRAM_SIZE = 256;
 const MIN_CONTRAST = 12;
 const DEFAULT_CURVE_TENSION = 0.9;
+const EXACT_CURVE_TENSION = 0;
+const MAX_FIT_SAMPLE_PIXELS = 12000;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -79,7 +81,7 @@ const getOtsuThreshold = (histogram, total) => {
   return bestThreshold;
 };
 
-const estimateAutoParameters = (imageData) => {
+const createLuminanceHistogram = (imageData) => {
   const { data, width, height } = imageData;
   const histogram = new Uint32Array(HISTOGRAM_SIZE);
   const total = width * height;
@@ -87,6 +89,13 @@ const estimateAutoParameters = (imageData) => {
   for (let pixelIndex = 0; pixelIndex < total; pixelIndex += 1) {
     histogram[Math.round(getPixelLuminance(data, pixelIndex))] += 1;
   }
+
+  return { histogram, total };
+};
+
+const estimateAutoParameters = (imageData) => {
+  const { width, height } = imageData;
+  const { histogram, total } = createLuminanceHistogram(imageData);
 
   const low = getPercentileFromHistogram(histogram, total, 0.05);
   const high = getPercentileFromHistogram(histogram, total, 0.95);
@@ -101,6 +110,183 @@ const estimateAutoParameters = (imageData) => {
     tolerance,
     smoothingPasses,
     curveTension: DEFAULT_CURVE_TENSION,
+  };
+};
+
+const createThresholdCandidates = (imageData, preferredThreshold) => {
+  const { histogram, total } = createLuminanceHistogram(imageData);
+  const otsu = getOtsuThreshold(histogram, total);
+  const low = getPercentileFromHistogram(histogram, total, 0.02);
+  const high = getPercentileFromHistogram(histogram, total, 0.98);
+  const midpoint = (low + high) / 2;
+  const seeds = [preferredThreshold, otsu, midpoint, 32, 64, 96, 128, 160, 192, 224]
+    .filter((value) => Number.isFinite(Number(value)))
+    .map((value) => Math.round(clamp(Number(value), 0, 255)));
+  const candidates = new Set();
+
+  for (const seed of seeds) {
+    for (const delta of [-24, -12, -6, 0, 6, 12, 24]) {
+      candidates.add(Math.round(clamp(seed + delta, 0, 255)));
+    }
+  }
+
+  return [...candidates].sort((a, b) => a - b);
+};
+
+const signedArea = (loop) => {
+  const points = stripClosingPoint(loop);
+  let area = 0;
+
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    area += current[0] * next[1] - next[0] * current[1];
+  }
+
+  return area / 2;
+};
+
+const pointInLoop = (pointX, pointY, loop) => {
+  const points = stripClosingPoint(loop);
+  let inside = false;
+
+  for (
+    let currentIndex = 0, previousIndex = points.length - 1;
+    currentIndex < points.length;
+    previousIndex = currentIndex, currentIndex += 1
+  ) {
+    const [currentX, currentY] = points[currentIndex];
+    const [previousX, previousY] = points[previousIndex];
+    const crosses = currentY > pointY !== previousY > pointY;
+
+    if (crosses) {
+      const intersectionX = ((previousX - currentX) * (pointY - currentY)) / (previousY - currentY) + currentX;
+
+      if (pointX < intersectionX) {
+        inside = !inside;
+      }
+    }
+  }
+
+  return inside;
+};
+
+const pointInEvenOddLoops = (pointX, pointY, loops) => loops.reduce(
+  (inside, loop) => (pointInLoop(pointX, pointY, loop) ? !inside : inside),
+  false,
+);
+
+const createFitSamples = (imageData, targetThreshold) => {
+  const { width, height, data } = imageData;
+  const step = Math.max(1, Math.ceil(Math.sqrt((width * height) / MAX_FIT_SAMPLE_PIXELS)));
+  const samples = [];
+  let darkCount = 0;
+
+  for (let y = Math.floor(step / 2); y < height; y += step) {
+    for (let x = Math.floor(step / 2); x < width; x += step) {
+      const isDark = getPixelLuminance(data, getPixelIndex(x, y, width)) <= targetThreshold;
+      samples.push({ x: x + 0.5, y: y + 0.5, isDark });
+      darkCount += isDark ? 1 : 0;
+    }
+  }
+
+  return { samples, darkCount, lightCount: samples.length - darkCount };
+};
+
+const scoreLoopsAgainstImage = (loops, fitSamples) => {
+  if (!loops.length || !fitSamples.samples.length) {
+    return {
+      errorRate: 1,
+      falsePositiveRate: 1,
+      falseNegativeRate: 1,
+      matched: 0,
+      total: fitSamples.samples.length,
+    };
+  }
+
+  let falsePositive = 0;
+  let falseNegative = 0;
+  let matched = 0;
+
+  for (const sample of fitSamples.samples) {
+    const inSvg = pointInEvenOddLoops(sample.x, sample.y, loops);
+
+    if (inSvg === sample.isDark) {
+      matched += 1;
+    } else if (inSvg) {
+      falsePositive += 1;
+    } else {
+      falseNegative += 1;
+    }
+  }
+
+  return {
+    errorRate: (falsePositive + falseNegative) / fitSamples.samples.length,
+    falsePositiveRate: falsePositive / Math.max(1, fitSamples.lightCount),
+    falseNegativeRate: falseNegative / Math.max(1, fitSamples.darkCount),
+    matched,
+    total: fitSamples.samples.length,
+  };
+};
+
+const createFitCandidateOptions = (imageData, options = {}) => {
+  const estimated = estimateAutoParameters(imageData);
+  const thresholds = createThresholdCandidates(imageData, options.threshold ?? estimated.threshold);
+  const toleranceValues = [0, 0.05, 0.1, 0.2, estimated.tolerance]
+    .map((value) => Number(value.toFixed(3)))
+    .filter((value, index, values) => values.indexOf(value) === index);
+  const candidates = [];
+
+  for (const threshold of thresholds) {
+    for (const tolerance of toleranceValues) {
+      candidates.push({
+        threshold,
+        tolerance,
+        smoothingPasses: 0,
+        curveTension: EXACT_CURVE_TENSION,
+      });
+    }
+  }
+
+  candidates.push({ ...estimated, smoothingPasses: 1, curveTension: DEFAULT_CURVE_TENSION });
+  return candidates;
+};
+
+const prepareLoops = (loops, { tolerance = 0, smoothingPasses = 0 } = {}) =>
+  loops
+    .map((loop) => simplifyClosedLoop(loop, Math.max(0, Number(tolerance) || 0)))
+    .map((loop) => chaikinSmoothClosedLoop(loop, Math.max(0, Number(smoothingPasses) || 0)))
+    .filter((loop) => stripClosingPoint(loop).length >= 3)
+    .sort((a, b) => Math.abs(signedArea(b)) - Math.abs(signedArea(a)));
+
+const fitParametersToImage = (imageData, options = {}) => {
+  const targetParameters = estimateAutoParameters(imageData);
+  const targetThreshold = targetParameters.threshold;
+  const fitSamples = createFitSamples(imageData, targetThreshold);
+  let best = null;
+
+  for (const candidate of createFitCandidateOptions(imageData, options)) {
+    const segments = buildContourSegments(imageData, candidate);
+    const rawLoops = traceLoops(segments);
+    const loops = prepareLoops(rawLoops, candidate);
+    const score = scoreLoopsAgainstImage(loops, fitSamples);
+
+    if (
+      !best ||
+      score.errorRate < best.score.errorRate ||
+      (score.errorRate === best.score.errorRate && candidate.tolerance < best.parameters.tolerance)
+    ) {
+      best = { parameters: candidate, rawLoops, loops, score };
+    }
+  }
+
+  return {
+    ...best,
+    parameters: {
+      ...best.parameters,
+      autoOptimize: true,
+      targetThreshold,
+    },
   };
 };
 
@@ -444,10 +630,10 @@ const loopsToPathData = (
 
 export const vectorizeBlackShape = (imageData, options = {}) => {
   const { width, height } = imageData;
-  const autoParameters = options.autoOptimize ? estimateAutoParameters(imageData) : {};
+  const fit = options.autoOptimize ? fitParametersToImage(imageData, options) : null;
+  const autoParameters = fit?.parameters || {};
   const resolvedOptions = { ...options, ...autoParameters };
-  const segments = buildContourSegments(imageData, resolvedOptions);
-  const loops = traceLoops(segments);
+  const loops = fit?.rawLoops || traceLoops(buildContourSegments(imageData, resolvedOptions));
   const bounds = getBounds(loops);
 
   if (!bounds) {
@@ -459,6 +645,7 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
       viewBox: '0 0 0 0',
       shapeCount: 0,
       parameters: { ...autoParameters },
+      comparison: fit?.score || null,
     };
   }
 
@@ -495,6 +682,8 @@ export const vectorizeBlackShape = (imageData, options = {}) => {
       smoothingPasses: Math.max(0, Number(resolvedOptions.smoothingPasses) || 0),
       curveTension: resolvedOptions.curveTension ?? DEFAULT_CURVE_TENSION,
       autoOptimize: Boolean(options.autoOptimize),
+      targetThreshold: resolvedOptions.targetThreshold,
     },
+    comparison: fit?.score || null,
   };
 };
