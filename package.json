@@ -1,0 +1,6 @@
+{
+  "scripts": {
+    "check": "node --check src/app.js && node --check src/vectorize.js && node tests/vectorize.test.js"
+  },
+  "type": "module"
+}
